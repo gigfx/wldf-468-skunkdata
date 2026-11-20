@@ -1,0 +1,510 @@
+---
+title: "Lab 11: Corridors and Least-Cost Paths"
+subtitle: "WLDF 468 Spatial Wildlife Ecology"
+author: Giovanna Ortiz
+output: html_document
+---
+
+<!-- LAB NOTE: Continue using a setup chunk to load packages. This week you'll need three packages: `terra`, `leastcostpath` (to calculate least-cost paths and corridors), and `geodata` (to download a human footprint layer). -->
+
+```{r setup, include=FALSE}
+# set your working directories
+if(!require(terra)){
+  install.packages("terra")
+  require(terra)
+}
+if(!require(leastcostpath)){
+  install.packages("leastcostpath")
+  require(leastcostpath)
+}
+if(!require(geodata)){
+  install.packages("geodata")
+  require(geodata)
+}
+
+library(ggplot2)
+library(tidyterra)
+```
+
+## Overview
+
+Over the last couple weeks you built a species distribution model (SDM) that shows where the climate suits your species now and where it is projected to suit it in the future. But a map of future suitable habitat doesn't tell you whether the species can actually *get there*. That is the third part of your capstone: an evaluation of how your species will move from where it is now to where it will need to be. For your final paper, you won't have to run and report the actual analysis (it requires a qualitative evaluation only), but this lab will help you think of how we describe linkages between suitable habitat patches. 
+
+This week you'll use your Lab 10 SDM to design a corridor. The steps are:
+
+1. Define where the species is now and where it needs to go (patches of suitable habitat)
+2. Convert relative environmental suitability into a **resistance surface**
+3. Find the **least-cost path** and a **least-cost corridor** between the patches
+4. Evaluate the corridor, including how adding human development changes it, and decide how far to trust it
+
+A few definitions:
+
+- **Resistance** is how much a landscape hinders movement, so a cell with high resistance is costly to cross. 
+- **Least-cost path** is the single cheapest route between two locations, found by adding up the resistance of the cells along each possible route. 
+- **Least-cost corridor** is a band of cells whose combined cost is close to the cheapest possible, so it shows several near-best routes rather than a single line.
+
+Zeller et al. (2012), which you read for lecture, reviewed several ways to estimate resistance. In this lab we use the approach based on habitat suitability, which assumes that the places animals prefer are also the places they find easy to move through. As you saw in lecture and in the reading, that assumption isn't always true: use is not the same as movement, and dispersing animals often behave differently from residents. Keep that in mind as you work. The corridor you produce is a hypothesis, not a prediction.
+
+I'll use the San Joaquin kit fox as the example, as in Lab 10. You can, and probably should, use the outputs from your own species' SDM instead. If you didn't use your project species in the previous lab, you could try asking someone from your group very nicely to use their lab 10 outputs. Otherwise, the kit fox output files are in the Lab 10 files folder on Canvas.
+
+To help you envision what the outputs should look like, I will be uploading a knitted version of my kit fox lab with plots and outputs included to the assignment page on Canvas. You can reference that to make sure you're on the right track.
+
+### Learning Outcomes
+After completing this lab, you should be able to:
+
+1. Define source and destination patches from current and future suitability maps
+2. Convert relative environmental suitability into a resistance surface using a negative exponential transformation
+3. Calculate a least-cost path and a least-cost corridor with `leastcostpath`
+4. Add a human footprint layer to a resistance surface and evaluate how it changes the corridor
+5. Interpret the corridor and describe its limitations
+
+
+## Getting started: Load your SDM outputs
+
+At the end of Lab 10, you saved three files in your working folder: `suitability_current.tif`, `suitability_future.tif` (relative environmental suitability from your best model, for current and 2041-2060 climate, on the same grid), and `occurrence_points.csv` (your occurrence records). If you didn't save them, you can use the kit fox files posted on Canvas (look in the Lab 10 folder under Files).
+
+```{r load-data}
+current.suit <- rast("suitability_current.tif")
+future.suit  <- rast("suitability_future.tif")
+names(current.suit) <- "suitability"
+names(future.suit)  <- "suitability"
+
+occ <- read.csv("occurrence_points.csv")
+occ.vect <- vect(occ, geom = c("x", "y"), crs = "epsg:4326")
+
+par(mfrow = c(1, 2))
+plot(current.suit, main = "Current", range = c(0, 1))
+plot(future.suit, main = "Future (2041-2060)", range = c(0, 1))
+par(mfrow = c(1, 1))
+
+global(current.suit, "range", na.rm = TRUE)
+global(future.suit, "range", na.rm = TRUE)
+```
+
+### Projecting to meters
+
+These maps are in latitude/longitude. Least-cost analysis adds up the cost of moving between neighboring cells, so it needs a projected coordinate system with units of meters (and the `leastcostpath` package requires one). We'll project both maps to UTM, as in Lab 10, at a cell size of 4 km (about the size of the original cells). If your species is in a different part of the world, choose a projected CRS appropriate for your study area.
+
+```{r project}
+proj.crs <- "epsg:32610
+"
+
+current.proj <- project(current.suit, proj.crs, res = 4000, method = "bilinear")
+
+# project the future map onto exactly the same grid as the current map
+future.proj  <- project(future.suit, current.proj, method = "bilinear")
+
+res(current.proj)
+dim(current.proj)
+```
+
+
+
+---
+
+## Defining patches: where the species is now, and where it needs to go
+
+A least-cost path connects two locations, so we need to decide what those are. We'll do this in three steps.
+
+**1. Decide what counts as "suitable."** The SDM gives a continuous index, so we need a threshold. A common choice is the suitability value that includes 90% of your occurrence records (the 10th percentile of suitability at the occurrence points). Cells at or above that value are "suitable."
+
+```{r threshold}
+occ.proj <- project(occ.vect, proj.crs)
+occ.suit <- extract(current.proj, occ.proj, ID = FALSE)[, 1]  # extract suitability values at every occ point
+
+threshold <- as.numeric(quantile(occ.suit, probs = 0.10, na.rm = TRUE))
+cat("threshold 1: ", threshold)
+
+threshold2 <- as.numeric(quantile(occ.suit, probs = 0.30, na.rm = TRUE))
+cat("threshold 2: ", threshold2)
+
+```
+
+
+
+**2. Find the patches.** We identify the suitable cells in the current and future maps, then use `patches()` to group neighboring suitable cells into numbered patches. 
+
+```{r patches, fig.width=10}
+current.suitable <- ifel(current.proj >= threshold, 1, NA)
+future.suitable  <- ifel(future.proj  >= threshold, 1, NA)
+
+
+current.suitable2 <- ifel(current.proj >= threshold2, 1, NA)
+future.suitable2  <- ifel(future.proj  >= threshold2, 1, NA)
+
+# New (2x2)
+par(mfrow = c(2, 2))
+plot(current.suitable, main = "Current [90% Occ]", range = c(0, 1))
+plot(future.suitable, main = "Future (2041-2060) [90% Occ]", range = c(0, 1))
+plot(current.suitable2, main = "Current [70% Occ]", range = c(0, 1))
+plot(future.suitable2, main = "Future (2041-2060) [70% Occ]", range = c(0, 1))
+par(mfrow = c(1, 1))
+
+# Let's just use the first threshold
+current.patches <- patches(current.suitable, directions = 8)
+plot(current.patches, main = "Current patches")
+
+
+# calculate the size of each current patch, in km2
+patch.sizes <- freq(current.patches)
+patch.sizes$area.km2 <- patch.sizes$count * prod(res(current.proj)) / 1e6
+head(patch.sizes)
+```
+
+
+We also find the **gain** areas: cells that are suitable in the future but not now. These are the places your species will need to reach.
+```{r gain}
+# which areas show future suitability but are not in the current 'suitable' map?
+gain <- ifel(future.proj >= threshold & current.proj < threshold, 1, NA)
+n.gain <- global(gain, "notNA")[1, 1]     # how many cells are gain area?
+n.gain
+plot(gain, main = "New future habitat")
+
+# plot combined
+plot(current.suitable, main = "Current vs Gain", range = c(0, 1),legend=F)
+plot(gain,col="green",legend=F,add=T)
+terra::add_legend("topright",legend=c("Current","Gain"),fill=c("yellow","green"))
+
+```
+
+
+If `n.gain` is 0, your species is projected to gain no new area, and you should skip the next chunk and use the "No gain area?" chunk below it instead.
+
+```{r gain-patches}
+gain.patches <- patches(gain, directions = 8)
+plot(gain.patches, main = "Future new patches")
+
+gain.sizes <- freq(gain.patches)
+gain.sizes$area.km2 <- gain.sizes$count * prod(res(current.proj)) / 1e6
+head(gain.sizes)
+```
+
+```{r no-gain, eval=FALSE}
+# ONLY use this chunk if your species has no gain area. Instead of connecting a current patch to a
+# new area, connect the two largest FUTURE patches (the future refuges):
+future.patches <- patches(future.suitable, directions = 8)
+future.sizes <- freq(future.patches)
+future.sizes <- future.sizes[order(future.sizes$count, decreasing = TRUE), ]
+
+# then, in the "source and destination" chunk below, use future.patches in place of
+# current.patches (source = future.sizes$value[1]) and in place of gain.patches (destination = future.sizes$value[2])
+```
+
+
+
+**3. Pick one location to represent each patch.** We'll connect the **largest current patch** (the source) to the **largest gain patch** (the destination), using the highest-suitability cell in each as the starting and ending points. Using one point per patch is a simplification, which we'll come back to in Exercise 5. The function below finds that best cell; a function is just a reusable set of instructions, like the ones you've been calling from packages.
+
+```{r nodes}
+# find the location of the highest-suitability cell within the given patch(es)
+get.best.cells <- function(patch.raster, suit.raster, patch.ids) {
+  xy <- NULL
+  for (id in patch.ids) {
+    cells <- ifel(patch.raster == id, suit.raster, NA)
+    idx <- which.max(values(cells)[, 1])
+    xy <- rbind(xy, xyFromCell(cells, idx))
+  }
+  xy
+}  # after running this, the function you defined is now stored in your environment, and you can use it on your data
+
+src.id  <- patch.sizes$value[which.max(patch.sizes$count)]   # Which current patch is largest?
+dest.id <- gain.sizes$value[which.max(gain.sizes$count)]     # Which future gained patch is largest?
+
+src.xy  <- get.best.cells(current.patches, current.proj, src.id)   # using the function you defined above
+dest.xy <- get.best.cells(gain.patches, future.proj, dest.id)
+
+src.xy
+dest.xy
+```
+
+### *Exercise 1*
+1. *Create a map that uses the current suitability map as a base layer (`current.proj`), and shows your source location in blue and your destination location in red (hint: use `geom_point()`). (4 pts)*
+
+```{r exercise-1-map, fig.width=7, fig.height=6, fig.align='center'}
+
+ggplot()+
+  
+  geom_spatraster(data = current.proj, aes(fill = suitability ))+
+  geom_point(data= as.data.frame(src.xy), aes(x=x, y=y), color= "blue", size = 1) +
+  geom_point(data= as.data.frame(dest.xy), aes(x=x, y=y), color= "red", size = 1)+
+  labs(x= "longitude", y= "latitude", title="Current Suitability With Source and Destination Locations", )
+  
+```
+
+2. *Report the threshold value you used to define "suitable", the area (km²) of the source patch, and the area of the destination patch. (2 pts)*
+
+I used threshold 1 to define suitable area. The area of the source patch is 1752768km² and the area of the destination patch is 48128km².
+
+---
+
+## From suitability to resistance
+
+Now we convert suitability into resistance. A simple option is a straight line: resistance = 1 − suitability. But Keeley et al. (2016) found, for long-distance movers, that a *negative exponential* transformation worked better. The idea is that animals will readily move through moderately suitable habitat and avoid only the worst. The transformation is:
+
+$$
+R = 100 - 99 \times \frac{1 - e^{-c \, h}}{1 - e^{-c}}
+$$
+
+where *R* is resistance (from 1, the best habitat, to 100, the worst), *h* is suitability (0 to 1), and *c* controls the shape of the curve. When c is about 0.25, the relationship is nearly a straight line. As *c* increases, resistance drops quickly as suitability rises, so most of the landscape becomes easy to cross. We'll use c = 4, a commonly used value for mobile species. Let's see what that curve looks like:
+
+```{r resistance, results='hide', fig.show='hide'}
+# the shape of the transformation
+h <- seq(0, 1, by = 0.01)
+plot(h, 100 - 99 * ((1 - exp(-4 * h)) / (1 - exp(-4))), type = "l", lwd = 2,
+     xlab = "Suitability", ylab = "Resistance")
+lines(h, 100 - 99 * ((1 - exp(-0.25 * h)) / (1 - exp(-0.25))), lty = 2, lwd = 2)
+legend("topright", legend = c("c = 4", "c = 0.25"), lty = c(1, 2), lwd = 2)
+
+plot(h, 100 - 99 * ((1 - exp(-10 * h)) / (1 - exp(-10))), type = "l", lwd = 2,
+     xlab = "Suitability", ylab = "Resistance")
+```
+
+The `leastcostpath` package works with **conductance**, the opposite of resistance: higher values mean easier movement. So we take the inverse of resistance and build the cost surface (the output of `create_cs` is referred to as a 'conductanceMatrix'). Using 16 neighbors means a path can move in 16 directions from each cell, which makes paths less "blocky" than using 4 or 8.
+
+```{r cost-surface, fig.width=10}
+c.par <- 6
+# generate resistance surface
+resistance <- 100 - 99 * ((1 - exp(-c.par * future.proj)) / (1 - exp(-c.par)))
+
+# transform to conductance surface
+conductance <- 1 / resistance
+
+# generate the cost surface
+cs <- create_cs(x = conductance, neighbours = 16)
+
+par(mfrow=c(1,3))
+plot(resistance, main = "Resistance")
+plot(conductance, main = "Conductance")
+plot(cs, main = "Cost Surface")
+par(mfrow=c(1,1))
+
+```
+
+### *Exercise 2*
+1. *Create a new map of the resistance surface using a new, distinct c value (NOT c = 4) with an informative title, and plot it side by side with the previous (c = 4) resistance surface. The new c value should be different enough to have a visible difference between the two maps. (3 pts)*
+
+```{r exercise-2-map, fig.width=6, fig.height=6, fig.align='center'}
+c.par <- 4
+# generate resistance surface
+resistance <- 100 - 99 * ((1 - exp(-c.par * future.proj)) / (1 - exp(-c.par)))
+
+# transform to conductance surface
+conductance <- 1 / resistance
+
+# generate the cost surface
+cs <- create_cs(x = conductance, neighbours = 16)
+
+#par(mfrow=c(1,3))
+
+#par(mfrow=c(1,1))
+
+
+c.par2 <- 10
+# generate resistance surface
+resistance2 <- 100 - 99 * ((1 - exp(-c.par2 * future.proj)) / (1 - exp(-c.par2)))
+
+
+# transform to conductance surface
+conductance <- 1 / resistance
+
+# generate the cost surface
+cs <- create_cs(x = conductance, neighbours = 16)
+
+
+#par(mfrow=c(1,3))
+
+par(mfrow=c(1,2))
+plot(resistance, main = "Resistance (c = 4)")
+plot(resistance2, main = "Resistance (c = 10)")
+
+```
+
+2. *Describe the difference in the resistance surface between the two values of c (c=4 and whichever you picked). How did the resistance surface change, and what does that imply about the species' biology or their relationship between suitability values and movement? (4 pts)*
+
+The difference between the two values is that c=10 showed a less resistant surface than c=4. This implies that the species is more of a generalist and can move through less suitable environments.
+
+3. *Choose a value for c that make the most sense for your species and state your reasoning. If you're working on the kit fox data, explain why c=4 makes sense. If you want to use a new value of c for the rest of the lab, copy and paste the `cost-surface` chunk below, with a new name, and edit to use your new c value. (NOTE: don't just edit that chunk above, or that will ruin your map for 2.1!) (2 pts)* 
+
+I changed the c value to 6 because skunks are a generalist species that don't experience as much resistance in less suitable areas.
+
+```{r}
+c.par3 <- 4
+# generate resistance surface
+resistance3 <- 100 - 99 * ((1 - exp(-c.par3 * future.proj)) / (1 - exp(-c.par3)))
+
+
+# transform to conductance surface
+conductance <- 1 / resistance
+
+# generate the cost surfac6
+cs.6 <- create_cs(x = conductance, neighbours = 16)
+
+plot(resistance3)
+```
+
+
+---
+
+## Least-cost path and cost corridor
+
+Now that we have the cost surface, we can find the cheapest route from the source to the destination. `create_lcp()` finds the least-cost path, and `create_cost_corridor()` calculates, for every cell, the combined cost of the best route from the source to that cell and on to the destination. Cells with low values lie on or near a good route. To turn that surface into a corridor, we keep the cells whose cost is within 5% of the cheapest possible.
+
+```{r lcp}
+# least-cost path (the result is converted to a terra vector with vect())
+lcp <- create_lcp(x = cs.6, origin = src.xy, destination = dest.xy,
+                  cost_distance = TRUE, check_locations = TRUE)
+lcp.vect <- vect(lcp)
+as.data.frame(lcp.vect)          # includes the accumulated cost of the path
+
+# length of the path, the straight-line distance between the two points, and the ratio
+path.km <- sum(perim(lcp.vect)) / 1000
+straight.km <- sqrt(sum((src.xy - dest.xy)^2)) / 1000
+path.km
+straight.km
+path.km / straight.km
+```
+Take a moment to consider what that ratio of the LCP distance and the straight line distance represents. Was it very easy for your species to get from the source to the destination point? 
+
+
+```{r corridor}
+# cost corridor: keep cells within 5% of the cheapest possible cost
+corridor <- create_cost_corridor(x = cs.6, origin = src.xy, destination = dest.xy)
+min.cost <- global(corridor, "min", na.rm = TRUE)[1, 1]
+corridor.zone <- ifel(corridor <= min.cost * 1.05, 1, NA)
+
+# How big is the corridor?
+corridor.km2 <- global(corridor.zone, "notNA")[1, 1] * prod(res(current.proj)) / 1e6
+corridor.km2
+```
+
+```{r lcp-map, message=FALSE}
+library(ggplot2)
+library(tidyterra)
+
+ggplot() +
+  geom_spatraster(data = future.proj) +
+  scale_fill_viridis_c(na.value = "transparent", name = "Cost") +
+  geom_spatvector(data = as.polygons(corridor.zone), fill = "red", alpha = 0.35, na.rm = TRUE) +
+  geom_spatvector(data = lcp.vect, color = "darkgreen", linewidth = 1) +
+  geom_point(data = as.data.frame(src.xy), aes(x = x, y = y), shape = 17, color = "blue", size = 3) +
+  geom_point(data = as.data.frame(dest.xy), aes(x = x, y = y), shape = 15, color = "red", size = 3) +
+  labs(title = "Least-cost path and corridor") +
+  theme_minimal() +
+  coord_sf(xlim = c(ext(lcp.vect)[1] * 0.95, ext(lcp.vect)[2] * 1.05), 
+           ylim = c(ext(lcp.vect)[3] * 0.98, ext(lcp.vect)[4] * 1.02)) 
+```
+
+**A sanity check:** the path should mostly follow cells with higher suitability. If it cuts straight through the poorest habitat, check that you passed *conductance* (not resistance) to `create_cs()`.
+
+### *Exercise 3*
+1. *Report the length of the least-cost path (km), the straight-line distance between the source and destination (km), the ratio of the two, and the area of the corridor (km²). (2 pts)*
+
+Least cost path: 214.6625 km
+Straight: Line Distance 179.6886 km
+Ratio: 1.194636 km
+Area of the corridor: 10608 km2
+
+2. *Describe what the path passes through. Does it stay mostly in moderate to high suitability, or does it cross poor areas? What does the ratio of path length to straight-line distance tell you? (2 pts)*
+
+The path passes through an area of poor suitability. The ratio of path length and straight line distance tell me that the path of least resistance was only 19% longer than the straight line path.
+
+---
+
+## Adding human development
+
+The SDM was built from climate alone, so it knows nothing about the things that most limit dispersal for many animals: roads, cities, and farmland. The **human footprint index** (Venter et al.) combines built-up areas, population density, power infrastructure, cropland, pasture, roads, railways, and waterways into a single score from 0 (low) to 50 (high pressure) at about 1 km resolution. Let's add it to the resistance surface.
+
+The file is global, so the first download may take a few minutes. We crop it to your study region, project it onto the same grid as your resistance surface, and rescale it to 0-1. Then we **add** it to the resistance: the most heavily developed cells gain +100, making them as hard to cross as the worst natural habitat.
+
+```{r footprint}
+footprint <- geodata::footprint(year = 2009, path = "data")
+
+fp <- crop(footprint, ext(current.suit))
+fp.proj <- project(fp, current.proj, method = "average")   # average the finer cells within each coarser cell
+fp.proj[is.na(fp.proj)] <- 0
+fp.scaled <- clamp(fp.proj / 50, 0, 1)
+plot(fp.scaled, main = "Human footprint (rescaled 0-1)")
+
+resistance.hf <- resistance3 + 100 * fp.scaled
+plot(resistance.hf, main = "Resistance (with HF)")
+```
+
+This weighting (+100) is an assumption for illustration. A different weight would change the result, and a real analysis would need to justify it. Now repeat the analysis with the new surface:
+
+```{r lcp-hf}
+cs.hf <- create_cs(x = 1 / resistance.hf, neighbours = 16)
+
+lcp.hf <- create_lcp(x = cs.hf, origin = src.xy, destination = dest.xy,
+                     cost_distance = TRUE, check_locations = TRUE)
+lcp.hf.vect <- vect(lcp.hf)
+
+corridor.hf <- create_cost_corridor(x = cs.hf, origin = src.xy, destination = dest.xy)
+min.cost.hf <- global(corridor.hf, "min", na.rm = TRUE)[1, 1]
+corridor.hf.zone <- ifel(corridor.hf <= min.cost.hf * 1.05, 1, NA)
+
+sum(perim(lcp.hf.vect)) / 1000       # length of the new path (km)
+```
+
+### *Exercise 4*
+1. *Create a map showing both least-cost paths (suitability only, and suitability plus human footprint) on top of the human footprint layer, with a title and legend. I've gotten it started for you below. (5 pts)*
+
+```{r exercise-5-map, fig.width=7, fig.height=6, fig.align='center'}
+lcp.lines <- rbind(lcp.vect, lcp.hf.vect)  # combine the two lines into one spatVector object!
+lcp.lines$group <- c("Suitability only", "Suitability + HFP")
+
+#fp.scaled.vect<- vect(fp.scaled)
+
+ggplot() +
+  geom_spatraster(data = fp.proj) +
+  scale_fill_whitebox_c(name = "Human Footprint") +
+  xlim(c(1650166, 2134166)) + ylim(c(2985874, 3357874)) +
+  geom_spatvector(data = lcp.lines, aes(color = group), linewidth = 1)+
+  labs(title = "Least Cost Path of Spilogale gracillis With and Without Human Footprint")
+  
+#SpatExtent : 1851166.6877896572, 2023166.6877896572, 3106874.055720252, 3226874.055720252 (xmin, xmax, ymin, ymax)
+  #plot(fp.scaled, main = "Human footprint (rescaled 0-1)")
+  
+
+```
+
+2. *In 3-4 sentences, describe how adding the human footprint changed the route (both in length, shape, and conceptually) and which version you think is more realistic for your species, and why. (4 pts)*
+
+Adding the human footprint actually shortened the length of the path. The original path was 214.7 km and the path with human footprint came out to be 197.5km. The suitability + HFP might actually create a more suitable path that would hypothetically eliminate some competition and land barriers such as elevation. I think the suitability + HFP path is more realistic for my species because they don't tend to avoid human prensence as much due to their generalist nature, at times they can benefit from it.
+
+---
+
+## Interpreting your corridor
+
+### *Exercise 5*
+1. *Look up a published dispersal distance for your species (or a close relative) and cite your source. Compare it to the length of your preferred least-cost path. Could an individual plausibly make this trip, and over how many dispersal events or generations might it take? How confident are you in this corridor, given all the data we put in? (4 pts)*
+
+The most relevant article I could fine was about spotted skunks, but they are closely related and have an overlapping range as the western spotted skunk. Based on the findings of Barshear et al. (2015), striped skunks only have a dispersal distance of around 2 km. These finding show that the length of the least cost path wouldn't be plausible for a spotted skunk as it is 214.6625 km. I'm not extremly confident in this corridor as it is too long two connect the two suitable habitats for the western spotted skunk.
+
+Wesley A. Brashear, Loren K. Ammerman, Robert C. Dowler, Short-distance dispersal and lack of genetic structure in an urban striped skunk population, Journal of Mammalogy, Volume 96, Issue 1, 15 February 2015, Pages 72–80, https://doi.org/10.1093/jmammal/gyu004
+
+---
+
+## Extra credit: all-pairs least-cost paths
+
+So far we connected one source to one destination. Another approach (recall the factorial least-cost paths from lecture) is to calculate least-cost paths between *many* pairs of locations and then add them up, which shows where movement would concentrate across the landscape. The code below picks the best cell in each of your three largest current patches and your three largest gain patches., calculates the paths between all pairs, and combines them into a density map.
+
+```{r extra-credit, eval = FALSE}
+top.current <- head(patch.sizes$value[order(patch.sizes$count, decreasing = TRUE)], 3)
+top.gain    <- head(gain.sizes$value[order(gain.sizes$count, decreasing = TRUE)], 3)
+
+locs <- rbind(get.best.cells(current.patches, current.proj, top.current),
+              get.best.cells(gain.patches, future.proj, top.gain))
+
+
+```
+
+### *Extra credit*
+*Remove `eval=FALSE`, and use the functions `create_FETE_lcps()` and `create_lcp_density()` to calculate the paths between all pairs of points and combine them into a density map, adn then plot the map with the point locations overlaid and an informative title. In 2-3 sentences, describe where movement concentrates and how this compares to your single least-cost path. (+3 pts)*
+
+
+
+---
+
+### *Exercise 6*
+*Reflect on today's lab. (3 pts)*
+
+I enjoyed today's lab and evaluating the LCPs of the western spotted skunk. I found including the human footprint and its alternative path particularly interestng. This lab seemed to go by smoother than past labs.

@@ -1,0 +1,390 @@
+---
+title: "Lab 9: Species Distribution Models I"
+subtitle: "WLDF 468 Spatial Wildlife Ecology"
+author: Giovanna Ortiz
+output: html_document
+---
+
+<!-- LAB NOTE: Continue using a setup chunk to assign your working directory and load packages. This week you'll need four packages: `rgbif` (to download species occurrence data), `terra`, `maps` (for quick base maps), and `geodata` (to download climate data). -->
+
+```{r setup, include=FALSE}
+# set your working directories
+if(!require(rgbif)){
+  install.packages("rgbif")
+  require(rgbif)
+}
+if(!require(terra)){
+  install.packages("terra")
+  require(terra)
+}
+if(!require(maps)){
+  install.packages("maps")
+  require(maps)
+}
+if(!require(geodata)){
+  install.packages("geodata")
+  require(geodata)
+}
+
+library(ggplot2)
+library(tidyterra)
+library(ggspatial)
+```
+
+## Overview
+
+Over the next few weeks we'll build correlative species distribution models (SDMs). This week is the first step in that workflow: acquiring species occurrence data and climate data, and exploring them before any modeling happens. Everything we need is accessible directly from R, using two publicly available databases:
+
+1. The **Global Biodiversity Information Facility (GBIF)** is a central clearinghouse for museum records and other records of species occurrences (for example, iNaturalist is an app for people to report species locations that is connected into the GBIF). More here: http://www.gbif.org/
+2. **BIOCLIM** is one of the most commonly used sources of spatially explicit bioclimatic data. It's available at 1 km resolution for the entire globe and represents average conditions from 1970-2000 (they also have alternate versions for the past and the future under different climate scenarios). More here: https://www.worldclim.org/data/bioclim.html
+
+The correlative SDMs we'll be looking at over the next few weeks all rely on the same fundamental concept as the habitat selection models you've been fitting: we compare the climate **used** by the species to the climate **available** to the species. While the statistical models rely on sometimes very complicated math to make those comparisons, it's always a good idea to make a visual comparison first, which is what you'll do at the end of this lab. Note that we're now looking at 1st order habitat selection (the selection of the geographic range), so "available" no longer means what's available to one animal over its lifetime, but what's available to the whole species over the course of many generations.
+
+### Learning Outcomes
+After completing this lab, you should be able to:
+
+1. Download species occurrence records from GBIF and clean them by record type, source, and location
+2. Download and explore global bioclimatic raster data in `terra`
+3. Extract climate values at species occurrence locations
+4. Define the area "available" to a species and sample available locations
+5. Visually compare the climate used by a species to the climate available to it
+
+
+## Getting started: Species occurrence data from GBIF
+
+The code below downloads all GBIF species records that have geospatial coordinates attached (i.e., `hasCoordinate=TRUE`). I've set it up for the San Joaquin kit fox (*Vulpes macrotis muticus*), but you should consider replacing the scientific name with the species you're working on for your final project! Be aware that the cleaning steps in the next section were chosen for the SJ kit fox, so if you use a different species you'll need to adapt them to your species' range and data sources. I've limited the download to the first 5,000 records.
+
+```{r gbif-download, results='hide', message=FALSE}
+sp.gbif <- occ_search(scientificName = "Spilogale gracilis",
+                       hasCoordinate = TRUE, hasGeospatialIssue=FALSE,
+                       fields='all', limit = 5000)
+```
+
+The output of that function is a "tibble", which comes from the "tidyverse" (you can learn more [here](https://www.tidyverse.org/)). We're already learning a whole separate set of spatial data structures, so we won't bother with these in this class. Let's convert the tibble back to a data frame, and take a closer look at the table you get:
+
+```{r to-dataframe}
+sp.occur <- data.frame(sp.gbif$data)
+unique(sp.occur$scientificName)
+
+head(sp.occur)  # remember you can scroll left-right through columns in the chunk output display below 
+colnames(sp.occur)
+```
+Wow, that's a lot of information!
+
+### *Exercise 1*
+*Pick five different columns from your species occurrence data table (`sp.occur`) that you think might have useful information, and describe what data those columns present (e.g., "`scientificName` reports the scientific name of the species accompanied by the reference to the originator"). They must not be columns with comparable information (i.e., don't explain both `kingdomKey` and `phylumKey`). You may need to go to the GBIF website to figure out what data is being presented. (5 pts)*
+
+- Column 1: decimalLatitude = latitudinal coordinate
+- Column 2: decimalLongitude = longitudinal coordinate
+- Column 3: verbatimLocality = location description
+- Column 4: eventDate = date event occurred 
+- Column 5: sex = sex of specific animal
+
+
+
+---
+
+## Cleaning the occurrence data
+
+Records in GBIF come from many different sources, and not all of them are appropriate for your analysis. You might consider filtering your data if there are any fossil records or other potentially inappropriate sources of locations. Start by looking at the types of records in the data:
+
+```{r basis-of-record}
+unique(sp.occur$basisOfRecord)
+
+# Sometimes, you might want to remove the "preserved specimens", meaning collected museum specimens, especially if they are very out of date. Let's see how the timing of the records lines up.
+table(sp.occur$year, sp.occur$basisOfRecord)
+
+# okay maybe we don't need an occurrence collected by a museum in 1903, or even data prior to the 1990s or so. Let's remove those. 
+sp.occur <- subset(sp.occur, year > 1990)
+
+table(sp.occur$year, sp.occur$basisOfRecord)
+```
+
+You can also subset based on which institutions you trust more than others. For example, iNaturalist is an app open to anybody to use. In theory, they're only supposed to pull "research grade" observations, but I've seen a "porcupine" on there that turned out to be a dead rabbit. The MVZ is the Museum of Vertebrate Zoology at UC-Berkeley. One may be more reliable than the other!
+
+```{r institutions}
+table(sp.occur$institutionCode)
+
+plot(sp.occur$decimalLatitude ~ sp.occur$decimalLongitude, col=as.integer(factor(sp.occur$institutionCode)))
+
+#sp.occur <- subset(sp.occur, institutionCode != "iNaturalist")
+table(sp.occur$institutionCode)
+```
+
+We might also find records that are wrongly identified or poorly geocoded. Check which countries the records come from, and the range of coordinates. Any record with a latitude below zero, for example, would be in the southern hemisphere, which can't be right for this species (this isn't actually necessary for this dataset, but its an example of what you should check!):
+
+```{r coords-check}
+table(sp.occur$country)
+
+plot(sp.occur$decimalLatitude ~ sp.occur$decimalLongitude)
+
+max(sp.occur$decimalLatitude, na.rm=TRUE)
+min(sp.occur$decimalLatitude, na.rm=TRUE)
+
+max(sp.occur$decimalLongitude, na.rm=TRUE)
+min(sp.occur$decimalLongitude, na.rm=TRUE)
+
+sp.occur <- subset(sp.occur, decimalLatitude > 0)
+
+plot(sp.occur$decimalLatitude ~ sp.occur$decimalLongitude)
+```
+
+Now let's plot the records on a map. (Note: if you've downloaded a different species, you'll want to update the `xlim` and `ylim` coordinates below to match the spatial extent of your species' range.)
+
+```{r map-check}
+map("world",xlim=c(-125,-90), ylim=c(15,50))
+map.axes()
+points(sp.occur$decimalLatitude ~ sp.occur$decimalLongitude)
+```
+
+There is an outlier far to the northeast of the rest of the points. Let's look at them:
+
+```{r outliers}
+
+#filtered out skunks in southern US and Mexico
+outliers <- sp.occur[sp.occur$decimalLatitude < 20,]
+
+table(outliers$institutionCode)
+
+table(outliers$specificEpithet)
+
+table(outliers$basisOfRecord)
+
+```
+
+There are lots of reasons how outliers might have ended up in the dataset. For now, let's just get rid of them:
+
+```{r remove-outliers}
+sp.occur <- subset(sp.occur, decimalLatitude > 20)
+
+map("world", xlim=c(-125,-90), ylim=c(15,50))
+map.axes()
+points(sp.occur$decimalLatitude ~ sp.occur$decimalLongitude)
+```
+
+That's a quick tutorial on downloading and cleaning data from GBIF. If you end up doing a lot of processing (or you download a lot of points), you might want to save your cleaned data as a CSV, so that in the future you can just re-load the CSV rather than re-downloading and re-processing from GBIF every time. This is also worth doing because GBIF is updated continuously, so the records you download today may differ slightly from a classmate's, or from your own re-download next month. Run `?write.csv` in the console to learn more about the function:
+
+```{r write-csv, eval=FALSE}
+write.csv(sp.occur, "sp_occur_clean.csv", row.names = FALSE)
+```
+
+
+---
+
+## Acquiring bioclimatic data
+
+Now let's look at downloading some bioclimatic data. (Run `?worldclim_global` in the console to see the documentation for the function.)
+
+```{r worldclim}
+climate <- worldclim_global(var = "bio", res = 5, download = TRUE, path = "data")
+
+class(climate)
+climate
+dim(climate)
+```
+
+Note that I set the resolution to '5', which is 5 arc-minutes. The finest resolution available is 0.5 arc-minutes, but in that case you have to specify lat/lon coordinates because the files download as separate tiles rather than for the whole globe, and stitching multiple tiles together may be required. The first time you run this it will download the files into a `data` folder in your working directory, which may take a few minutes.
+
+The output tells you that the `climate` rasters are 2160 x 4320 pixels and the raster stack has 19 different layers (`wc2.1_5m_bio_1`, `wc2.1_5m_bio_2`, etc.). Let's plot one of them:
+
+```{r plot-bio3}
+plot(climate[[3]])
+```
+
+### *Exercise 2*
+1. *What bioclimatic variable did we just plot? (Hint: the BIOCLIM website will tell you.) (1 pt)*
+***Isothermality***
+2. *Plot global mean annual precipitation. Make sure the plot has an informative title. (2 pts)*
+
+```{r exercise-2-precip, fig.width=7, fig.height=4, fig.align='center'}
+plot(climate[[12]],
+     main = "Annual Precipitaion in mm")
+```
+
+---
+
+## Extracting climate at occurrence locations
+
+In order to evaluate the environmental drivers of species occurrence, we need to know the environmnetal conditions at each occurence point. To do this, first convert the GBIF data into a `SpatVector` (the coordinates are longitude/latitude, so the CRS is WGS84, EPSG:4326), and plot the points on top of one of the climate layers:
+
+```{r make-vect}
+sp.occur.vect <- vect(x = sp.occur, 
+                      geom = c("decimalLongitude", "decimalLatitude"), 
+                      crs = crs("epsg:4326"))
+
+plot(climate[[1]], xlim=c(-125,-90), ylim=c(15,50))
+points(sp.occur.vect)
+```
+
+Now let's look at the climate conditions where your species has been recorded. Next, use `extract()` to pull the climate values for every layer at each occurrence point, then add those values to our existing spatial data:
+
+```{r extract-climate}
+# Extract the values to a new data frame
+climate.vals <- terra::extract(climate, sp.occur.vect, ID=FALSE)
+
+summary(climate.vals)
+
+# Replace very small numbers with NA, as this sometimes occurs if terra doesn't code the clim data correctly
+climate.vals <- replace(climate.vals, climate.vals < -10000, NA)
+
+# Add those values to our existing spatial data
+sp.occur.vect <- cbind(sp.occur.vect, climate.vals)
+```
+
+And now histograms of the values should look ok:
+
+```{r hist-climate}
+hist(sp.occur.vect$wc2.1_5m_bio_8, xlab = "Mean Temperature of Wettest Quarter", 
+     col = "cadetblue",border = "gray", main = NULL)
+
+
+# ## If you wanted to make the histogram or a dnesity plot in ggplot
+# library(ggplot2)
+# ggplot(as.data.frame(sp.occur.vect), aes(x = wc2.1_5m_bio_8)) + geom_histogram(fill = "darkseagreen")
+# ggplot(as.data.frame(sp.occur.vect), aes(x = wc2.1_5m_bio_8)) + geom_density(fill = "darkseagreen", alpha = 0.6)
+
+```
+
+### *Exercise 3*
+*Create a histogram of maximum temperature (look up which BIOCLIM variable this is) at your species' occurrence locations. Make sure to label the x-axis appropriately (hint: what units are these in? Double-hint: use the `xlab` parameter when you create your histogram). (3 pts)*
+
+```{r exercise-3-hist, fig.width=6, fig.height=4, fig.align='center'}
+hist(sp.occur.vect$wc2.1_5m_bio_5, xlab = "Maximum Temperature", 
+     col = "orchid",border = "gray", main = "Occurrence")
+```
+
+
+
+---
+
+## Comparing used vs. available climate
+
+Now for the visual comparison described in the Overview. You've now seen the climate **used** by your species (the climate at its occurrence points). I'd like you to create a comparable histogram of the minimum temperature in the areas **available** to your species.
+
+### *Exercise 4*
+*Create a figure comparing the minimum temperature of the coldest month (BIOCLIM variable 6) at the locations used by your species to the locations available to it. Here are the steps to lead you through it: (15 pts)*
+
+1. *Project your `SpatVector` into UTM or another reasonable projection (we're going to buffer the points, and buffering lat/lon is never a good idea). You can use `occ.utm <- project(your.occ.vect, "epsg:XXXX")` with whatever ESPG code makes sense for your dataset. Check out a map of the UTM zones if you're not sure, and look up the appropriate zone's EPSG.*
+2. *Create an aggregated buffer around your points. It's up to you to pick a reasonable buffer distance. For some mobile species, you might pick a large buffer; for more sessile organisms, a smaller buffer. But consider creating a buffer large enough that there are no holes within your distribution. Remember, we're looking at 1st order habitat selection, the selection of the geographic range. I'd consider creating a rather large buffer on the order of 10's, 100's or for some species even 1000's of km. We're no longer thinking about availability for an individual organism in its lifetime, but to the entire species over the course of many generations.*
+3. *Randomly sample some points (how many is up to you) from the buffer polygon.*
+4. *Extract the minimum temperature at those points. Remember that the points need to be in the same CRS as the climate raster (or vice versa) when you extract values. It will take less processing time to project the random points back into their original CRS [e.g. `project(rndm.pts, your.occ.vect)`].*
+5. *Create your histograms (or density plots) of the used and available minimum temperatures. Please make your histograms in such a way that the used vs. available histograms are comparable (e.g., same x-axis limits).*
+
+*Hint: you used `buffer()`, `aggregate()`, and `spatSample()` in Lab 5 to do something very similar for the porcupine data.*
+
+```{r exercise-4-avail}
+# Steps 1-4: project, buffer, sample available points, extract minimum temperature
+
+#project spat vector into a UTM
+occ.utm<- project(sp.occur.vect, "epsg:5070")
+
+#create a buffer
+
+dists<- distance(occ.utm)
+max.dist <- max(dists)
+max.dist
+
+plot(occ.utm, main = "Occurrence Points")
+
+buffer.temp <- buffer(occ.utm, width= 400000)
+plot(buffer.temp, main = "Occurrence with Buffers")
+
+skunk.range <- aggregate(buffer.temp)
+plot(skunk.range, main = "Skunk Range")
+
+
+#randomly sample points
+rndm.pts <- spatSample(skunk.range, size=nrow(occ.utm), method="random") # generate random points within buffered study area
+plot(rndm.pts, cex = 0.5, main = "Random Points")
+
+#Extract the minimum temperature
+project(rndm.pts, climate)
+project(occ.utm,climate)
+
+crs(climate)==crs(rndm.pts) #checking if they have the same CRS
+
+#matching the CRS
+rndm.pts <- project(rndm.pts, crs(climate))
+crs(climate) == crs(rndm.pts)  
+
+#extracting at the random points
+rndm.climate.vals <- terra::extract(climate$wc2.1_5m_bio_6, rndm.pts, ID=FALSE)
+occ.climate.vals <- terra::extract(climate$wc2.1_5m_bio_6, sp.occur.vect, ID=FALSE)
+
+nrow(occ.climate.vals)
+```
+
+```{r exercise-4-hist, fig.width=7, fig.height=5, fig.align='center'}
+# Step 5: used vs. available histograms
+
+#help identify xlim for histograms
+range(rndm.climate.vals[,1], occ.climate.vals[,1], na.rm = TRUE)
+
+hist(rndm.climate.vals[,1], xlim = c(-24, 20), breaks = seq(-24, 20, by = 2), 
+     xaxt = "n",
+     xlab = "Min. Temperature of Coldest Month (°C)", 
+      col = "orangered",border = "gray57", main = "Available")
+axis(1, at = seq(-24, 20, by = 4))
+
+hist(occ.climate.vals[,1], xlim = c(-24, 20), breaks = seq(-24, 20, by = 2), 
+     xaxt = "n",
+     xlab = "Min. Temperature of Coldest Month (°C)", 
+      col = "steelblue1",border = "black", main = "Used")
+axis(1, at = seq(-24, 20, by = 4))
+
+
+```
+notes (to self):
+`breaks = seq(-24, 20, by = 2)`: sets bins so the bars line up nicely
+`xaxt = "n"`: gets rid of original axis
+`axis(1, at = seq(-24, 20, by = 4))`: sets new tick marks on the axis
+
+info pulled from r-charts website, stack overflow forum, and statology
+
+
+---
+
+## Mapping your data
+
+### *Exercise 5*
+1. *Create a map in R (using ggplot) of your species' occurrence data, the buffer you created, and the available points you randomly sampled, along with any other ancillary information you think is important (e.g., a title, legend, scale bar, or north arrow). (6 pts)*
+
+```{r exercise-5-map, fig.width=7, fig.height=6, fig.align='center'}
+
+#skunk range map
+spotted_skunk_dm <- vect("ws-skunk-range.shp")
+
+
+#projecting range to match CRS
+skunk.range.v2<- project(skunk.range, crs(climate))
+crs(climate) == crs(skunk.range.v2) #checking the match
+
+my_title <- expression(paste(italic("Spilogale gracilis"), " Occurrence Points"))
+
+ggplot() +
+  geom_spatvector(data = skunk.range.v2, aes(fill = "Buffer"), color = "black") +
+  geom_spatvector(data = spotted_skunk_dm, aes(fill = "Range")) +
+  geom_spatvector(data = rndm.pts, aes(color = "Available"), size = 1) +
+  geom_spatvector(data = sp.occur.vect, aes(color = "Used")) +
+  scale_color_manual(values = c("Available" = "tomato3", "Used" = "steelblue4")) +
+  scale_fill_manual(values = c("Buffer" = "ivory2", "Range" = "burlywood1"))+
+  labs(color = "Points", fill = "") +
+  
+  
+  annotation_scale(location = "tr") + annotation_north_arrow(location = "tr", which_north = "true", pad_y = unit( 1.0, "cm"), pad_x = unit (1, "cm"), height = unit(0.75, "cm"), width = unit(0.75, "cm"))+
+  
+  ggtitle(my_title)
+```
+
+2. *Extra credit: find a range map for your species and add it to your map. Many species have shapefiles available somewhere online (check IUCN red list!), but some of you might need to digitize it from a paper map (or a downloaded image). Please let me know if you need guidance on how to do that. (+2 pts)*
+
+
+
+---
+
+### *Exercise 6*
+*Reflect on today's lab. (3 pts)*
+
+This lab was thorough. I was able to spend time in making my histograms line up nicely for easier readability. I enjoyed putting together the final plot and seeing all of the data really come together in a presentable way. Converting an image to a shapefile is not as simple as I thought it was going to be (hopefully I was able to get help with the extra credit before this portion was due).
+
+

@@ -1,0 +1,491 @@
+---
+title: "Lab 10: Species Distribution Models II"
+subtitle: "WLDF 468 Spatial Wildlife Ecology"
+author: Giovanna Ortiz
+output: html_document
+---
+
+<!-- LAB NOTE: Continue using a setup chunk to load packages. This week you'll need at least these packages: `rgbif` (to download species occurrence data), `terra`, `maps` (for quick base maps), `geodata` (to download climate data), and `ENMeval` and `ecospat` (to run and evaluate Maxent models). -->
+
+```{r setup, include=FALSE}
+# set your working directories
+if(!require(rgbif)){
+  install.packages("rgbif")
+  require(rgbif)
+}
+if(!require(terra)){
+  install.packages("terra")
+  require(terra)
+}
+if(!require(maps)){
+  install.packages("maps")
+  require(maps)
+}
+if(!require(geodata)){
+  install.packages("geodata")
+  require(geodata)
+}
+if(!require(ENMeval)){
+  install.packages("ENMeval")
+  require(ENMeval)
+}
+if(!require(ecospat)){
+  install.packages("ecospat")
+  require(ecospat)
+  
+}
+
+library(ggplot2)
+library(tidyterra)
+library(patchwork)
+library(ggspatial)
+```
+
+## Overview
+
+Last week you acquired and explored occurrence and climate data for a species. This week you'll use those data to create a distribution model with **Maxent**, select a top model, and then use that top model to project into the future. I'm skipping a few steps (for example, we'll only use BIOCLIM layers, but you might want to include other predictors), but this lab covers almost all of the major steps you'll need for the final project.
+
+We'll fit Maxent models with the `ENMeval` package, which runs the models in R (using the `maxnet` implementation of Maxent) across a range of model settings and calculates evaluation statistics for each one, so that we can choose among them. Recall from lecture that Maxent compares the environmental conditions at the occurrence points to the conditions at **background** points sampled from the study area. That is the same used vs. available logic you applied last week.
+
+A note on terminology: I'll refer to the model predictions as **relative environmental suitability**. The map values are a relative index of how similar the environment in a cell is to the environment at the occurrence points, compared to the study area as a whole. They are *not* true probabilities of occurrence, and they don't tell us anything about habitat quality, survival, or reproduction. Only the ordering of cells (and relative differences) is meaningful.
+
+### Learning Outcomes
+After completing this lab, you should be able to:
+
+1. Define a study area and crop and mask predictor layers to it
+2. Fit Maxent models across a range of settings using `ENMeval`
+3. Select a top model using AICc and evaluate it with the Continuous Boyce Index (CBI) and other metrics
+4. Interpret response curves and map relative environmental suitability
+5. Project the selected model onto future climate data and compare the future prediction to the current one
+
+
+## Getting started: Occurrence data
+
+The next few steps are identical to last week's lab. You should understand what each line is doing, but let me know if you have questions. I'll use the San Joaquin kit fox (*Vulpes macrotis muticus*) as my example, but feel free to load your own species' data and follow along with that. (As last week, the cleaning steps below were chosen for the kit fox, so adapt them if you use a different species. If you saved a cleaned CSV last week, you can read it in with `read.csv()` instead of re-downloading.)
+
+```{r occurrence-data}
+
+skunk.data.df<- read.csv("sp_occur_clean.csv")
+skunk.data<- vect(skunk.data.df, crs = "epsg:4326", geom = c("decimalLongitude", "decimalLatitude"))
+
+#sp.occur <- subset(sp.occur, year > 1990)
+#sp.occur <- subset(sp.occur, institutionCode != "iNaturalist")
+#sp.occur <- subset(sp.occur, decimalLatitude > 0)
+#sp.occur <- subset(sp.occur, decimalLatitude < 38)
+
+map("world", xlim=c(-125,-90), ylim=c(15,50))
+map.axes()
+points(skunk.data)
+
+nrow(skunk.data)
+```
+
+
+## Acquiring bioclimatic data
+
+Note that I'm using a resolution of 2.5 arc-minutes (roughly 4-5 km) to save time, both in downloading the climate data and in running the models. For the final project you *might* want to switch to finer-scale data (e.g., `res = 0.5`), especially if your species has a lot of data across a fairly small extent, or small home ranges. A higher-resolution is also sometimes needed if your occurrence data is very clumped together, because each grid cell of environmental data can only be included as one occurrence `observation`, so any points that lie in the same raster cell of environmental data become effectively redundant. 
+
+```{r worldclim}
+climate <- worldclim_global(var = "bio", res = 2.5, download = TRUE, path = "data")
+
+plot(climate[[1]])
+points(skunk.data)
+```
+
+
+## Defining the study area
+
+Maxent needs to know what area the species could have occupied, because it draws its background points from within that area. We'll define the study area with a buffer around the occurrence points, as you did last week, and then clip the climate layers to it. Because we're buffering, we first project the points into UTM (a projected CRS with units of meters). Zone 10N covers most of the kit fox range; choose the projection that works best for your own species.
+
+```{r study-area}
+# Project occurrence points to UTM
+skunk.occur.utm <- project(skunk.data, "epsg:32610")
+
+# Buffer (width is in meters), then dissolve into a single polygon
+buffer.utm <- terra::buffer(skunk.occur.utm, width = 400000)
+buffer.utm <- aggregate(buffer.utm)
+plot(buffer.utm)
+points(skunk.occur.utm)
+
+# And project the buffer back into Lat/Lon to match the climate layers
+buffer.wgs <- project(buffer.utm, skunk.data)
+```
+
+<!-- Note: some versions of `terra` have had problems with the `buffer()` line above. If you get an error about a "ptr", please (1) click Session -> Restart R, (2) in the console run `unlink(".Rdata")`, then `rm(list=ls())`, then `install.packages("terra")`, and (3) go back to the top, load the packages, and start again. -->
+
+I'm going to subset the climate to just annual mean temperature (BIO1), isothermality (BIO3), annual precipitation (BIO12), and precipitation seasonality (BIO15). For your final project, you'll need to decide as a group which predictors to include (or add from other sources).
+
+```{r clip-climate}
+subset.clim <- climate[[c(1,3,12,15)]]
+plot(subset.clim)
+
+# rename the layers for easier interpretation
+names(subset.clim) = c("an.mean.temp","isotherm","an.precip","precip.seasonality")
+
+# "Crop" the raster so it has the same extent as the buffer
+crop.clim <- terra::crop(subset.clim, buffer.wgs)
+plot(crop.clim[[1]])
+
+# And "mask" it so that the outline is the same
+final.clim <- terra::mask(crop.clim, buffer.wgs)
+plot(final.clim[[1]])
+plot(buffer.wgs, add=TRUE)
+points(skunk.data)
+```
+
+
+
+---
+
+## Running Maxent
+
+Maxent has two main settings you can tune. **Feature classes** (`fc`) control how flexible the response to each predictor can be: **L**inear, **Q**uadratic, **H**inge, **T**hreshold, and **P**roduct (interactions between predictors). The **regularization multiplier** (`rm`) controls how strongly the model is penalized for complexity (higher values give smoother, simpler models). `ENMeval` fits a model for every combination of settings you give it, which lets us pick the best-supported combination.
+
+The commented code below is what I'd recommend for your final project: all of the feature class combinations and regularization multipliers from 0.5 to 2.5.
+
+```{r full-tune-args, eval=FALSE}
+## DO NOT RUN ##
+# tune.args <- list(fc = c("L","Q", "H", "T", # fit types allowed + combos
+#                          "LQ", "LH", "LT", "QH", "QT", "HT",
+#                          "LQH", "LQT", "QHT", "LHT", "LQHT"), 
+#                   rm = seq(from=0.5, to=2.5, by=0.5))
+```
+
+For purposes of illustration, though, I'm using a much smaller set so that the models run faster. Note that none of these include the "product" feature (the interactions); feel free to add it back in ("LQHTP") for your own models.
+
+```{r tune-args}
+tune.args <- list(fc = c("LHT", "LQH"),
+                  rm = seq(from=0.5, to=1, by=0.5))
+
+tune.args
+```
+
+**STOP.** Before continuing, make sure you know: 
+
+- What do the 'fc' and 'rm' options within `tune.args` refer to? ['fc' controls the flexibility of respose to each predictor. 'rm' controls complexity]
+- How many different models do you expect to be generated based on those options? [4 models]
+
+
+`ENMeval` needs to evaluate how well each model predicts data it wasn't fit to, so it splits the occurrence data into partitions. By default it uses 5, but for time I'm subsetting to just 3.
+
+```{r partition-settings}
+partition.settings <- list(kfolds = 3)
+```
+
+Please read through the help file for `ENMevaluate` (run `?ENMevaluate` in the console) so that some of this makes more sense! By default, `ENMevaluate` randomly samples 10,000 background points from within the study area (the masked climate layers). This took about 1.5 minutes to run on my laptop, so be patient, especially when you knit. 
+<!-- If the `parallel` option gives you an error on your computer, set `parallel = FALSE` OR add an argument `numCores = 2`. If you get an "error reading from connection" message, run `gc()` in the console at the bottom and then try again. -->
+
+```{r run-maxent}
+max.output <- ENMevaluate(occs = crds(skunk.data),
+                          envs = final.clim,
+                          tune.args = tune.args,
+                          algorithm = "maxnet",
+                          partitions = "randomkfold",
+                          partition.settings = partition.settings,
+                          parallel = TRUE)
+
+```
+
+<!-- Note: I'm using random k-fold partitions here for speed and simplicity. As discussed in lecture, random partitions can give optimistic performance estimates when occurrence points are spatially clustered. `ENMevaluate` also offers spatial partitioning (e.g., `partitions = "block"`), which you should consider for your final project. -->
+
+**STOP.** Before continuing, make sure you know: 
+
+-What does each argument in the `ENMevaluate` represent? Use ?ENMevaluate and make sure you understand what you used as inputs for the model you just made! 
+  -envs: environmental predictor variables
+  -tune.args: model settings to be tuned
+  -algorithm: name of algorithm
+  -partitions: name of partitioning technique
+  -partition.setting: specify certain settings for partitioning
+  -parallel: if TRUE, run with parallel processing
+
+
+**Saving results.** In past years, saving the results with `save()` and re-loading them with `load()` did not work reliably for some students (the results would load but then wouldn't work). This is because the results contain `terra` raster objects, which don't always survive being saved and re-loaded. If possible, keep the results loaded in your R session rather than re-loading them from a file. If you do want to try it, the commands are:
+
+```{r save-results, eval=FALSE}
+library(readr)
+write_rds(max.output, file="test_maxent_model.rds")
+
+# this is how you'd read it back into R in a new session
+# max.output <- read_rds("test_maxent_model.rds")
+```
+
+**STOP.** Before continuing, make sure you know: 
+
+- Where your model object is stored on your computer. [wldf468-lab10]
+- How to access that object and put it back into R if you were to restart your R session and don't want to take the time to re-run the model. [`max.output <- read_rds("test_maxent_model.rds")`]
+
+
+
+## Evaluating the models
+
+Now we'll evaluate the models. We'll (1) compare AICc and Boyce Index scores, (2) plot response curves, and (3) plot predictions.
+
+```{r evaluate, warning=FALSE, message=FALSE,}
+# Highest level summary of the models:
+max.output
+
+# List of objects you might explore: 
+str(max.output, max.level=2)       # (each name after an @ symbol is the name of a `slot` or a piece of the model you could extract)
+
+# Table comparing the models tested (with additional accuracy metrics):
+max.output@results
+
+# Plot AICc results across values of the regularization multiplier:
+evalplot.stats(e = max.output, stats = "AICc", color.var = "fc", x.var = "rm")
+```
+
+The results table includes several columns, but these are the ones to focus on: `AICc` and `delta.AICc` (AICc is the small-sample version of AIC that you used in Lab 6; the model with `delta.AICc` = 0 has the lowest AICc), `cbi.val.avg` (the Continuous Boyce Index calculated on the held-out validation partitions, averaged across partitions; higher values indicate better predictions), and `auc.val.avg` (AUC on the validation partitions, closer to 1 is better).
+
+Now select the best model based on the top (lowest) AICc score. Rather than typing the model name by hand, this code finds it for us:
+
+```{r best-model}
+results.table <- max.output@results
+
+# the model(s) with delta AICc = 0, and the name of the first one
+best.name <- results.table$tune.args[which(results.table$delta.AICc == 0)[1]]
+best.name
+
+best.model <- max.output@models[[best.name]]
+```
+
+### *Exercise 1*
+1. *Print the results table showing, for each model you tested, the columns `tune.args`, `AICc`, `delta.AICc`, `cbi.val.avg`, and `auc.val.avg`. (Hint: you can select columns from a data frame using their names, e.g., `max.output@results[ , c("tune.args", "AICc")]`.) (4 pts)*
+
+```{r exercise-1-table}
+max.output@results[ , c("tune.args", "AICc", "delta.AICc", "cbi.val.avg","auc.val.avg")]
+```
+
+2. *Which model has the lowest AICc? Does it also have the highest CBI? What does each metric tell you about a model, and why might they not always agree? (3 pts)*
+
+The model with the lowest AICc is fc.LHT_rm.0.5, it also has the highest cbi. AICc estimates how well a model fits the data that generated it, and penalizes how complex a model is. DeltaAICc is the difference between the AIC scores of the best model and the model being compared. Cbi.val.avg is the "Average Validation Boyce Index", which tells you predictive accuracy and how well a model can generalize data. Auc.val.avg is the "Average Validation Under the Curve" which tells how often the model gives a higher suitability score to a presence over areas that don't have presence data. They might not always agree for a variety of reasons, one being that a model can incorporate all the data well(AICc), but it might not make as accurate of predictions(cbi.val.avg). This just comes down to the different factors each metric analyzes.
+
+---
+
+## Response curves
+
+Response curves show how the model's prediction changes as one predictor changes. Let's plot them for the best model (there are four predictors, so we'll plot them in a 2 x 2 layout):
+
+```{r response-curves}
+par(mfrow=c(2,2))
+plot(best.model, type="cloglog")
+par(mfrow=c(1,1))
+```
+
+### *Exercise 2*
+1. *Plot the response curve for ONE predictor variable that you think depicts an interesting effect (Hint: you can use the argument `var = "predictor.name"` in the plot call). Then, in plain language, describe how relative suitability changes with this predictor. For example, at what values of mean temperature is suitability highest, and is there a threshold value at which the relationship changes? Do these responses seem biologically plausible for your species? Remember that each curve is conditional on the other variables in the model (i.e., the other variables are held constant for these predictions). (8 pts)*
+
+For annual mean temperature, suitability seems to highest at 10 degrees Celsius. Suitability is lowest as mean temperature drops and gradually drops as the temperature rises. The threshold, according to this models seems to be around 10 degrees Celcius with a drop in either direction. These responses seem biologically viable to my species as the spotted skunk is not found in many areas with relatively extreme high or lows (such as mountains or deserts/areas with sparse coverage). 
+
+```{r exercise-2-curves, fig.width=7, fig.height=7, fig.align='center'}
+
+plot(best.model, type="cloglog", var = "an.mean.temp")
+```
+
+
+
+---
+
+## Current relative environmental suitability
+
+Now let's map the current model's predictions. `ENMevaluate` stores a prediction for every model it fit; we'll pull out the one for our best model:
+
+```{r current-suitability}
+current.suitability <- max.output@predictions[[names(max.output@predictions) == best.name]]
+crs(current.suitability) <- crs(final.clim)
+# Older versions of ENMeval returned a RasterLayer rather than a SpatRaster.
+# If that's what you have, convert it:
+if(!inherits(current.suitability, "SpatRaster")){
+  current.suitability <- rast(current.suitability)
+}
+
+par(mfrow=c(1,1))
+plot(current.suitability)
+points(skunk.data)
+```
+
+### *Exercise 3*
+1. *Using ggplot, create a map of the current relative environmental suitability with your occurrence points visible on top, including an informative title and essential map elements. (5 pts)*
+
+```{r exercise-3-map, fig.width=6, fig.height=6, fig.align='center'}
+
+my_title <- expression(paste(italic("Spilogale gracilis"), "Relative Habitat Suitability and Actual Occurrence "))
+
+ggplot() +
+  geom_spatraster(data = current.suitability) +
+  geom_spatvector(data = skunk.data, aes(color = "Occurrence")) +
+  scale_fill_hypso_c(name = "Suitability")+
+  scale_color_manual(values = c("Occurrence" = "black"))+
+  labs(color = "Points", fill = "") +
+  annotation_scale(location = "tr") + annotation_north_arrow(location = "tr", which_north = "true", pad_y = unit( 1.0, "cm"), pad_x = unit (1, "cm"), height = unit(0.75, "cm"), width = unit(0.75, "cm"))+
+  
+  ggtitle(my_title)
+
+```
+
+2. *Describe the spatial pattern of the predictions. Identify an area where the model predicts high suitability but you have no occurrence records, and give two possible explanations for why (think about the BAM framework and about how occurrence data are collected). (3 pts)*
+
+The predictions with low suitability are in desert regions and high suitability shows to be in coastal regions and areas around (but not in) mountain ranges. An area of high suitability with no occurrence data is a patch around 107W,27N; this might be due to a lack of collected data or sampling and not necessarily that they aren't there. Another reason might be because there isn't a presence of spotted skunks due to the surrounding areas showing low suitability.
+
+---
+
+## Projecting to future climate
+
+Now we'll use the best model to predict where the climate will be suitable in the future. First, download future climate data. I'd recommend looking at the future climate data page on the WorldClim website (https://www.worldclim.org/data/cmip6/cmip6climate.html) to better understand the options. Here we'll use one global climate model (ACCESS-CM2), a high-emissions scenario (SSP 5-8.5), and the time period 2041-2060, at the same resolution as the current climate.
+
+```{r future-climate}
+future.clim <- cmip6_world(model = "ACCESS-CM2", ssp = "585",
+                           time = "2041-2060",
+                           var = "bioc",
+                           res = 2.5,
+                           path = "./futureclim")
+```
+
+Next, subset to the same predictors used in the initial model:
+
+```{r future-subset}
+future.subset <- future.clim[[c(1,3,12,15)]]
+names(final.clim)
+names(future.subset)
+```
+
+The names of the projection variables need to match the names of the predictors in the original model, so we rename them. *Make sure the order is correct when you do this.*
+
+```{r rename-future}
+names(future.subset) <- names(final.clim)
+```
+
+Now project the best model onto the future climate. Note that plugging in the `future.subset` object would predict environmental suitability over the entire globe at 2.5 arc-minutes, which can take a few minutes and a fair amount of memory. At this stage, it is important to choose a prediction extent that is relevant to your species and the research question. This will depend on the species you've chosen. Do you want to predict only wihtin their current range map, or put a buffer around it? Do you want to predict in areas where they might travel to or become invasive in the future? There are many options, and it is important that you are able to justify your decision. Also note that, by default, the predictions for conditions outside the range of the training data are held at the values at the edge of that range.
+
+Here, I am going to predict the future suitability within the same extent we cropped our climate data to earlier, since that was already a fairly large buffer around the current distribution of SJ kit foxes and they are not likely to spread farther than that in the next 30 years. 
+
+```{r project-future}
+future.clim <- terra::mask(terra::crop(future.subset, buffer.wgs), buffer.wgs)
+
+future.suitability <- terra::predict(future.clim, best.model,
+                                     type = "cloglog", na.rm = TRUE)
+plot(future.suitability)
+
+```
+
+### *Exercise 4*
+1. *Create a raster layer showing the difference between current and future suitability values (i.e., `diff <- current.suitability - future.suitability`). You might have to project one to match the other if they differ slightly in extent (see `terra::project()`). (1 pt)*
+2. *Using ggplot, create a figure with three side-by-side maps (in any orientation/rows/columns, but as one figure): (1) current relative environmental suitability, (2) future (2041-2060, SSP 5-8.5) relative environmental suitability, and (3) the difference between them. All plots should be zoomed to a relevant extent Use the same color scale for both of the relative suitability maps so that they are comparable, and a color scale appropriate for showing the difference in values between them for the third map. Give each an informative title. (5 pts)*
+
+<!-- NOTE: When you use `ggplot` to create a side-by-side figure, the `par(mfrow=c(1,2))` approach doesn't work, because `ggplot` doesn't use the base R graphics internally. Instead, you can use the `patchwork` package, which combines `ggplot` objects with | (side by side) or / (stacked), or gridExtra::grid.arrange(p1, p2, ncol = 2). I've included an example of these at the bottom of this document to help you out. -->
+
+```{r exercise-4-maps, fig.width=15, fig.height=8, fig.align='center'}
+
+current.projection<- project(current.suitability, future.suitability)
+diff <- current.projection - future.suitability
+plot(diff)
+
+p1 <-ggplot() +
+    geom_spatraster(data = current.projection) +
+    geom_spatvector(data = skunk.data, aes(color = "Occurrence")) +
+    scale_fill_princess_c(name = "Suitability")+
+    scale_color_manual(values = c("Occurrence" = "black"))+
+    labs(color = "Points", fill = "") +
+    annotation_scale(location = "tr") + annotation_north_arrow(location = "tr", which_north = "true", pad_y = unit( 1.0, "cm"), pad_x = unit (0.25, "cm"), height = unit(0.75, "cm"), width = unit(0.75, "cm")) +
+  labs(title = "Current Suitability")
+
+
+p2<- ggplot() +
+    geom_spatraster(data = future.suitability) +
+    geom_spatvector(data = skunk.data, aes(color = "Occurrence")) +
+    scale_fill_princess_c(name = "Suitability")+
+    scale_color_manual(values = c("Occurrence" = "black"))+
+    labs(color = "Points", fill = "") +
+    annotation_scale(location = "tr") + annotation_north_arrow(location = "tr", which_north = "true", pad_y = unit( 1.0, "cm"), pad_x = unit (0.25, "cm"), height = unit(0.75, "cm"), width = unit(0.75, "cm"))+
+  labs(title = "Future Suitability")
+
+p3 <-ggplot() +
+    geom_spatraster(data = diff) +
+    geom_spatvector(data = skunk.data, aes(color = "Occurrence")) +
+    scale_fill_cross_blended_c(name = "Change in Suitability")+
+    scale_color_manual(values = c("Occurrence" = "black"))+
+    labs(color = "Points", fill = "") +
+    annotation_scale(location = "tr") + annotation_north_arrow(location = "tr", which_north = "true", pad_y = unit( 1.0, "cm"), pad_x = unit (0.25, "cm"), height = unit(0.75, "cm"), width = unit(0.75, "cm"))+
+  labs(title = "Difference  (current - future)")
+
+(p1 | p2 | p3) 
+
+#/ (p3 + plot_spacer())   # side by side
+```
+
+3. *In a few sentences, describe how the predicted suitability changes between the two maps (e.g., areas gained, lost, or shifted). Be detailed to earn full points (consider it practice for interpreting the outputs of your final project). (3 pts)*
+
+The biggest change between the current and future models is the loss of suitable habitat. The biggest changes occurred around the along the coast of California and northern Mexico. The unsuitable area around southern California and Arizona (around 32-36°N, 112-118°W) has grown in size. There's also an area on the west coast of Mexico (around 22-27°N, 103-109°W) that became more suitable.
+
+
+
+
+---
+
+## Saving your results for next week
+
+Next week's lab builds a corridor from your suitability maps. So that you don't have to re-run the model, save the current and future predictions as GeoTIFF files. We predict over a rectangular region slightly larger than your study area (so there is room for your species to "move" beyond the buffer), and both maps are saved on exactly the same grid.
+
+```{r save-for-next-week}
+margin <- 1    # degrees (about 100 km) added around the study area; increase if your species may need to move farther
+
+analysis.region <- extend(ext(buffer.wgs), margin)
+
+# crop the current and future climate to the region (layer names must match what the model expects)
+current.region <- crop(subset.clim, analysis.region)
+future.region  <- crop(future.subset, analysis.region)
+names(current.region) <- names(final.clim)
+names(future.region)  <- names(final.clim)
+
+# predict relative environmental suitability with your best model
+current.region.suit <- terra::predict(current.region, best.model, type = "cloglog", na.rm = TRUE)
+future.region.suit  <- terra::predict(future.region,  best.model, type = "cloglog", na.rm = TRUE)
+
+plot(c(current.region.suit, future.region.suit))   # quick check before saving: current (left) and future (right)
+
+# save the maps and your occurrence points in your working folder
+writeRaster(current.region.suit, "suitability_current.tif", overwrite = TRUE)
+writeRaster(future.region.suit,  "suitability_future.tif",  overwrite = TRUE)
+write.csv(crds(skunk.data), "occurrence_points.csv", row.names = FALSE)
+
+```
+
+
+
+---
+
+### *Exercise 5*
+*Reflect on today's lab. (3 pts)*
+
+When I got to exercise 4 I had a few issues. I had to configure the figure settings so the information on the plots didn't overlap. I'm sure there is another way to do it but I couldn't find anything that would seem to work. I was a little confused on how to read the difference plot, but fgiured it out after clarification. I feel like this lab overall helped prepare me for our final project.
+
+
+
+
+<!-- Example of side-by-side plots using patchwork, using a shared color scale so the two maps are comparable: -->
+
+```{r map-example, eval = F, include = F}
+library(ggplot2)
+library(tidyterra)
+library(patchwork)
+
+p1 <- ggplot() +
+  geom_spatraster(data = raster1) +
+  scale_fill_viridis_c(limits = c(0, 1), na.value = "transparent") +
+  labs(title = "Name of layer")
+
+p2 <- ggplot() +
+  geom_spatraster(data = raster2) +
+  scale_fill_viridis_c(limits = c(0, 1), na.value = "transparent", option = "plasma") +
+  labs(title = "Name of layer")
+
+p1 | p2   # side by side
+
+p1 / p2   # top and bottom
+
+
+#--- OR ---# 
+
+library(gridExtra)
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+
+```
