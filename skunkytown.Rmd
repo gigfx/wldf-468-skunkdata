@@ -1,0 +1,165 @@
+---
+title: "skunkytown"
+output: html_document
+date: "2026-11-16"
+names: Giovanna Ortiz, Cameron A. Cooper, Paige Ottosen, Chloe Dekker, Alisa Montgomery
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ggplot2)
+library(terra)
+library(tidyterra)
+library(ggspatial)
+library(maps)
+library(geodata)
+library(ENMeval)
+library(ecospat)
+library(patchwork)
+```
+
+## R Markdown
+
+```{r, filtering data}
+skunk.data.df<- read.csv("sp_occur_clean.csv")
+skunk.data.df <- filter(skunk.data.df, country == "United States of America")
+skunk.data<- vect(skunk.data.df, crs = "epsg:4326", geom = c("decimalLongitude", "decimalLatitude"))
+
+
+
+```
+
+
+
+
+```{r}
+
+
+chixy<-ext(-120.5,-119.4,33.6,34.2)
+skonka<-erase(skunk.data, chixy)
+plot(e)
+#whole map
+map("world", xlim=c(-125,-90), ylim=c(15,50))
+points(e)
+map.axes()
+
+
+
+#cropped points
+#map("world", xlim=c(-120.5,-119), ylim=c(33.6,34.8))
+#points(e)
+#map.axes()
+```
+```{r, minimum temp}
+climate <- worldclim_global(var = "bio", res = 2.5, download = TRUE, path = "data")
+
+plot(climate[[6]], xlim=c(-125,-90), ylim=c(15,50), main = "minimum temp. in coldest month")
+points(skunk.data)
+
+```
+```{r}
+
+skunk.utm <- project(skonka, "epsg:32610")
+
+
+buffer.utm <- terra::buffer(skunk.utm, width = 400000)
+buffer.utm <- aggregate(buffer.utm)
+plot(buffer.utm)
+points(skunk.utm)
+
+buffer.wgs <- project(buffer.utm, skonka)
+
+```
+
+
+
+```{r, climate-vars}
+
+
+subset.clim <- climate[[c(6, 12)]]
+plot(subset.clim)
+
+
+crop.clim <- terra::crop(subset.clim, buffer.wgs)
+
+
+final.clim <- terra::mask(crop.clim, buffer.wgs)
+plot(final.clim[[1]])
+
+plot(buffer.wgs, add=TRUE)
+points(skunk.data)
+
+```
+
+
+
+```{r}
+
+
+stack <- c(r1, r2, ...)
+
+
+```
+
+
+tune.args <- list(fc = c("LHT"), 
+                   rm = seq(from=2, to=2, by=1))
+
+tune.args
+
+partition.settings <- list(kfolds = 3)
+
+max.output <- ENMevaluate(occs = crds(skonka),
+                          envs = final.clim,
+                          tune.args = tune.args,
+                          algorithm = "maxnet",
+                          partitions = "randomkfold",
+                          partition.settings = partition.settings,
+                          parallel = TRUE)
+
+max.output
+
+max.output@results
+
+evalplot.stats(e = max.output, stats = "AICc", color.var = "fc", x.var = "rm")
+
+max.output@results[ , c("tune.args", "AICc", "delta.AICc", "cbi.val.avg","auc.val.avg")]
+
+results.table <- max.output@results
+
+best.name <- results.table$tune.args[which(results.table$delta.AICc == 0)[1]]
+best.name
+
+best.model <- max.output@models[[best.name]]
+plot(best.model)
+
+
+current.suitability <- max.output@predictions[[names(max.output@predictions) == best.name]]
+crs(current.suitability) <- crs(final.clim)
+
+par(mfrow=c(1,1))
+plot(current.suitability)
+points(skunk.data)
+
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r current-suit}
+
+
+ggplot() +
+  geom_spatraster(data = current.suitability) +
+  geom_spatvector(data = skunk.utm) +
+  scale_fill_princess_c(name = "Suitability") +
+  annotation_north_arrow(location = "tr") +
+  annotation_scale(location = "bl") +
+  theme_minimal() +
+  labs(title = "Current Suitability")
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
